@@ -79,3 +79,17 @@ def test_ref_requires_consent(tmp_path):
     job = Job(job.model_id, job.text, job.output, reference=ref, voice_consent=False)
     with pytest.raises(ValueError):
         render(job, lic, Fake())
+
+def test_multiple_base_speakers_rejected_before_synthesis(tmp_path):
+    ref = tmp_path / "voice.wav"
+    ref.write_bytes(b"sample")
+    model = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+    lic = LicenseRecord(model, LicenseStatus.REVIEW_REQUIRED, "test")
+    job = Job(model, "[speaker=A]Первый. [speaker=B]Второй.", tmp_path / "out.wav",
+              reference=ref, reference_text="Образец", voice_consent=True)
+    class BaseFake(Fake):
+        model_id = model
+    engine = BaseFake()
+    with pytest.raises(ValueError, match="нескольких персонажей"):
+        render(job, lic, engine)
+    assert engine.calls == 0
