@@ -81,6 +81,8 @@ def render(job: Job, license_record: LicenseRecord, engine: Engine,
             continue
         key_data = dict(text=event.text, style=asdict(event.style), model=job.model_id,
                         revision=license_record.weights_revision or "unverified",
+                        license_status=license_record.status.value,
+                        engine_source=getattr(engine, "cache_identity", job.model_id),
                         reference_sha256=ref_sha, reference_text=job.reference_text,
                         generator_version="0.1.0a1")
         key = hashlib.sha256(json.dumps(key_data, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
