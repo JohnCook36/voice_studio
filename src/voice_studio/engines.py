@@ -56,17 +56,23 @@ class QwenEngine:
             raise EngineError(f"Не удалось загрузить модель {self.model_id}: {exc}") from exc
         return self._model
 
-    def synthesize(self, text: str, style: Style, reference: Path | None,
-                   reference_text: str) -> Audio:
+    def validate_style(self, style: Style) -> None:
         is_base = self.model_id.endswith("-Base")
         if style.speed != 1.0 or style.voice != "normal":
             raise EngineError("Выбранный адаптер пока не поддерживает speed/whisper/shout")
         if is_base and style.emotion != "neutral":
             raise EngineError("Base: управление эмоциями не подтверждено – используйте CustomVoice 1.7B")
         if not is_base and "0.6B" in self.model_id and style.emotion != "neutral":
-            raise EngineError("CustomVoice 0.6B не поддерживает гарантированное управление эмоциями")
+            raise EngineError("CustomVoice 0.6B не поддерживает управление эмоциями")
+        if style.intensity != 0.5 and (is_base or "0.6B" in self.model_id or style.emotion == "neutral"):
+            raise EngineError("Этот движок не поддерживает настройку интенсивности в текущем режиме")
         if not is_base and style.speaker not in {"Ryan", "Aiden", "Serena", "Vivian", "Uncle_Fu", "Dylan", "Eric", "Ono_Anna", "Sohee"}:
             raise EngineError("Для готового голоса выберите встроенный профиль Qwen")
+
+    def synthesize(self, text: str, style: Style, reference: Path | None,
+                   reference_text: str) -> Audio:
+        self.validate_style(style)
+        is_base = self.model_id.endswith("-Base")
         if is_base and (not reference or not reference.is_file() or not reference_text.strip()):
             raise EngineError("Для клонирования Base нужны референс WAV и его точная расшифровка")
         model = self._load()
@@ -78,7 +84,8 @@ class QwenEngine:
             if "1.7B" in self.model_id and style.emotion != "neutral":
                 emotion_prompt = {"happy": "joyfully", "sad": "sadly", "anger": "angrily",
                                   "fear": "fearfully", "surprise": "with surprise", "sarcasm": "sarcastically"}
-                options["instruct"] = f"Speak in Russian {emotion_prompt[style.emotion]}, with natural expression."
+                strength = "subtly" if style.intensity < 0.35 else ("very expressively" if style.intensity > 0.75 else "clearly")
+                options["instruct"] = f"Speak in Russian {strength} {emotion_prompt[style.emotion]}, with natural expression."
             wavs, rate = model.generate_custom_voice(**options)
         if not wavs or not rate:
             raise EngineError("Нейросеть вернула пустое аудио")
