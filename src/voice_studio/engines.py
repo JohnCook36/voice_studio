@@ -31,6 +31,7 @@ class QwenEngine:
         self.model_id = model_id
         self.download_allowed = download_allowed
         self.local_model = local_model
+        self.cache_identity = model_id + ":" + (str(Path(local_model).resolve()) if local_model else "official")
         self._model = None
 
     def _load(self):
