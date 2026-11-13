@@ -16,7 +16,8 @@ def main() -> None:
     parser.add_argument("--smoke", action="store_true", help="Проверить запуск окна без моделей")
     opts = parser.parse_args()
     try:
-        from PySide6.QtCore import QThread, Signal, QTimer
+        from PySide6.QtCore import QThread, Signal, QTimer, QUrl
+        from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
         from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                        QHBoxLayout, QTextEdit, QLabel, QComboBox, QPushButton,
                                        QLineEdit, QCheckBox, QFileDialog, QMessageBox,
@@ -55,6 +56,10 @@ def main() -> None:
             self.setWindowTitle("Voice Studio · локальная озвучка (прототип)")
             self.resize(900, 720)
             self.worker = None
+            self.player = QMediaPlayer(self)
+            self.audio_output = QAudioOutput(self)
+            self.player.setAudioOutput(self.audio_output)
+            self.audio_output.setVolume(0.8)
             box = QWidget()
             self.setCentralWidget(box)
             layout = QVBoxLayout(box)
@@ -116,6 +121,13 @@ def main() -> None:
             self.cancel_btn.setEnabled(False)
             self.cancel_btn.clicked.connect(self.cancel)
             controls.addWidget(self.cancel_btn)
+            self.play_btn = QPushButton("▶ Прослушать готовое")
+            self.play_btn.setEnabled(False)
+            self.play_btn.clicked.connect(self.play_last)
+            controls.addWidget(self.play_btn)
+            self.pause_btn = QPushButton("⏸ Пауза")
+            self.pause_btn.clicked.connect(self.player.pause)
+            controls.addWidget(self.pause_btn)
             layout.addLayout(controls)
             self.bar = QProgressBar()
             self.bar.setRange(0, 1)
@@ -200,6 +212,8 @@ def main() -> None:
             self.status.setText(f"Готово фрагментов: {current}/{total}")
 
         def on_success(self, path: str):
+            self.player.setSource(QUrl.fromLocalFile(str(Path(path).resolve())))
+            self.play_btn.setEnabled(True)
             self.status.setText(f"Сохранено: {path} + provenance.json")
             QMessageBox.information(self, "Voice Studio", "Озвучка сохранена:\n" + path)
 
@@ -210,6 +224,10 @@ def main() -> None:
         def on_finished(self):
             self.cancel_btn.setEnabled(False)
             self.check_license()
+
+        def play_last(self):
+            if self.player.source().isValid():
+                self.player.play()
 
         def cancel(self):
             if self.worker:
