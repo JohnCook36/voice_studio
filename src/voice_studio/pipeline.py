@@ -66,7 +66,14 @@ def render(job: Job, license_record: LicenseRecord, engine: Engine,
         raise ValueError("Для Base необходимы референс и текст образца")
 
     events = parse(job.text, speaker=job.speaker)
-    total = sum(isinstance(x, Speech) for x in events)
+    styles = [x.style for x in events if isinstance(x, Speech)]
+    if job.model_id.endswith("-Base") and len({x.speaker for x in styles}) > 1:
+        raise ValueError("Для нескольких персонажей Base нужны отдельные голосовые профили; функция ещё не реализована")
+    validator = getattr(engine, "validate_style", None)
+    if validator is not None:
+        for style in styles:
+            validator(style)
+    total = len(styles)
     ref_sha = _digest_file(job.reference)
     cache = job.output.parent / ".voice_studio_cache"
     cache.mkdir(parents=True, exist_ok=True)
