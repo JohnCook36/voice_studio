@@ -1,0 +1,52 @@
+# Secrets and local environments
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.idea/
+.vscode/
+
+# User books, private voices and audio renders
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+*.epub
+*.docx
+*.pdf
+user_data/
+voices/
+projects/
+recordings/
+renders/
+exports/
+fragments/
+cache/
+logs/
+
+# Model weights and downloads
+models/
+checkpoints/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.bin
+
+# Local data and distribution
+*.db
+*.sqlite
+*.sqlite3
+build/
+dist/
+*.exe
+*.msi
+*.zip
