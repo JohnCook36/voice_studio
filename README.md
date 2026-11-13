@@ -31,3 +31,11 @@ Windows 11 Pro · NVIDIA RTX 4060 Ti 8 GB VRAM · Ryzen 5 3600 · 16 GB RAM. Т�
 - [Репозиторий](https://github.com/JohnCook36/voice_studio)
 
 Не добавлять в git личные WAV/MP3, исходные тексты книг, реальные профили голоса, токены, веса и модели.
+
+## Первый работающий срез (ветка feature/mvp-voice-core)
+
+Добавлена реализация на Python/PySide6, два режима Qwen3-TTS (CustomVoice и Base), разбиение текста, WAV/MP3, разрешённое клонирование голоса, сохранение прогресса и строгая проверка лицензий.
+
+**Запуск:** [docs/08-implementation.md](docs/08-implementation.md). Исходная документация в [docs/01-product.md](docs/01-product.md) – [docs/07-roadmap.md](docs/07-roadmap.md).
+
+Пока не проверены реальные нейросетевые генерации на RTX 4060 Ti, сборка EXE и работа в Smart App Control. Для всех стартовых моделей коммерческий режим заблокирован до аудита весов и зависимостей.
