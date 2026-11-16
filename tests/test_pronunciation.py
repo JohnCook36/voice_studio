@@ -37,3 +37,10 @@ def test_roundtrip_and_invalid_json(tmp_path):
     path.write_text("garbage", encoding="utf-8")
     with pytest.raises(PronunciationError):
         load_dictionary(path)
+
+
+def test_manual_stress_options_and_cleanup():
+    from voice_studio.pronunciation import stress_variants
+    assert stress_variants("замок") == ["за\u0301мок", "замо\u0301к"]
+    assert stress_variants("замо\u0301к") == ["за\u0301мок", "замо\u0301к"]
+    assert stress_variants("слово два") == []

@@ -100,3 +100,15 @@ def save_dictionary(rules: dict[str, str], path: Path | None = None) -> Path:
     finally:
         Path(temp).unlink(missing_ok=True)
     return file
+
+
+def stress_variants(word: str) -> list[str]:
+    """Place U+0301 after each possible Russian vowel for per-occurrence editing."""
+    if not isinstance(word, str) or not 1 <= len(word) <= 80:
+        return []
+    clean = word.replace("\u0301", "")
+    if not re.fullmatch(r"[А-Яа-яЁё]+", clean):
+        return []
+    vowels = "аеёиоуыэюяАЕЁИОУЫЭЮЯ"
+    return [clean[:index+1] + "\u0301" + clean[index+1:]
+            for index, char in enumerate(clean) if char in vowels]

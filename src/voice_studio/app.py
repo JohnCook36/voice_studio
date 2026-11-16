@@ -21,11 +21,12 @@ def main() -> None:
     opts = parser.parse_args()
     try:
         from PySide6.QtCore import QThread, Signal, QTimer, QUrl, Qt
+        from PySide6.QtGui import QTextCursor
         from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
         from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                        QHBoxLayout, QTextEdit, QLabel, QComboBox, QPushButton,
                                        QLineEdit, QCheckBox, QFileDialog, QMessageBox,
-                                       QProgressBar, QGroupBox, QDialog, QSlider)
+                                       QProgressBar, QGroupBox, QDialog, QSlider, QInputDialog)
     except ImportError as exc:
         raise SystemExit("Для графического интерфейса: pip install -e .[gui]") from exc
 
@@ -251,9 +252,12 @@ def main() -> None:
             self.preview_btn = QPushButton("🎧 Послушать все 9 голосов")
             self.preview_btn.clicked.connect(self.open_voice_previews)
             voice_actions.addWidget(self.preview_btn)
-            self.pron_btn = QPushButton("Словарь ударений и произношения")
+            self.pron_btn = QPushButton("Словарь произношения")
             self.pron_btn.clicked.connect(self.open_pronunciation)
             voice_actions.addWidget(self.pron_btn)
+            self.accent_btn = QPushButton("Ударение выделенного слова")
+            self.accent_btn.clicked.connect(self.mark_stress)
+            voice_actions.addWidget(self.accent_btn)
             layout.addLayout(voice_actions)
 
             clone_box = QGroupBox("Клонирование: только свой или разрешённый голос (Base)")
@@ -311,6 +315,23 @@ def main() -> None:
         def open_pronunciation(self):
             from .gui_narration import PronunciationDialog
             PronunciationDialog(self).exec()
+
+        def mark_stress(self):
+            from .pronunciation import stress_variants
+            cursor = self.editor.textCursor()
+            if not cursor.hasSelection():
+                cursor.select(QTextCursor.SelectionType.WordUnderCursor)
+            word = cursor.selectedText()
+            choices = stress_variants(word)
+            if not choices:
+                QMessageBox.information(self, "Ударение",
+                    "Выделите одно русское слово либо поставьте курсор внутри слова.")
+                return
+            chosen, accepted = QInputDialog.getItem(self, "Ударение",
+                "Выберите ударную гласную. Qwen может проигнорировать этот знак:", choices, 0, False)
+            if accepted:
+                cursor.insertText(chosen)
+                self.editor.setTextCursor(cursor)
 
         def open_voice_previews(self):
             from .gui_narration import VoicePreviewDialog
