@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voice-studio-local"
-version = "0.2.0a1"
+version = "0.2.0a2"
 description = "Offline-first, license-aware Russian TTS desktop prototype"
 requires-python = ">=3.11"
 dependencies = []

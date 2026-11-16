@@ -53,6 +53,7 @@ jobs:
           if (-not (Test-Path $uvExe)) { throw "uv.exe not found: $uvExe" }
           python -m PyInstaller --noconfirm --clean --onefile --windowed --name VoiceStudioSetup --paths . `
             --hidden-import bootstrap.core `
+            --hidden-import bootstrap.source_update `
             --add-binary "$uvExe;." `
             --add-data "voice_studio_source.zip;." `
             bootstrap/launcher.py

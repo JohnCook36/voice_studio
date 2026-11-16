@@ -102,7 +102,7 @@ def render(job: Job, license_record: LicenseRecord, engine: Engine,
                         license_status=license_record.status.value,
                         engine_source=getattr(engine, "cache_identity", job.model_id),
                         reference_sha256=ref_sha, reference_text=job.reference_text,
-                        generator_version="0.2.0a1")
+                        generator_version="0.2.0a2")
         key = hashlib.sha256(json.dumps(key_data, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
         wav = cache / (key + ".wav")
         if not wav.is_file():
