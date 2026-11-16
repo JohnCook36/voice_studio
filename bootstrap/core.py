@@ -184,28 +184,45 @@ def ensure_packages(uv: Path, python: Path, *, neural: bool, reporter=None) -> R
 
 
 def install_source_zip(resource: Path, root: Path) -> Path:
-    """Copy only vetted bundled source, never extract untrusted paths."""
+    """Activate verified pending update, never downgrade an installed version.
+
+    The small setup EXE contains the version originally bundled with it.
+    Blindly copying it on every launch would undo in-app updates.
+    """
+    from voice_studio.updater import apply_pending_update, get_installed_version, version_key, UpdateError
+
     if not resource.is_file():
         raise BootstrapError("В установщике отсутствует исходный пакет Voice Studio")
-    with zipfile.ZipFile(resource) as archive:
-        names = set(archive.namelist())
-        if "voice_studio/__init__.py" not in names or "voice_studio/app.py" not in names:
-            raise BootstrapError("Повреждён пакет приложения")
-        for info in archive.infolist():
-            name = info.filename
-            if name.startswith("/") or "\\" in name or ".." in Path(name).parts:
-                raise BootstrapError("Некорректный путь в пакете приложения")
+    try:
+        bundled_version = get_installed_version(resource)
+    except UpdateError as exc:
+        raise BootstrapError(str(exc)) from exc
+
     root.mkdir(parents=True, exist_ok=True)
     target = root / "app-src.zip"
-    digest = hashlib.sha256(resource.read_bytes()).digest()
-    if target.is_file() and hashlib.sha256(target.read_bytes()).digest() == digest:
-        return target
+
+    # Important: bootstrap core must be able to read the updater from a
+    # bundled bootstrap module (see separate bootstrap/updater_core.py). The
+    # following import is replaced with that independent copy below.
+    try:
+        apply_pending_update(root)
+    except UpdateError as exc:
+        raise BootstrapError("Проверка обновления не прошла: " + str(exc)) from exc
+
+    if target.is_file():
+        try:
+            installed_version = get_installed_version(target)
+        except UpdateError as exc:
+            raise BootstrapError("Установленная версия повреждена: " + str(exc)) from exc
+        if version_key(installed_version) >= version_key(bundled_version):
+            return target
+
     fd, tmp = tempfile.mkstemp(prefix=".voice-studio_", suffix=".zip", dir=root)
     os.close(fd)
     try:
         shutil.copyfile(resource, tmp)
-        if hashlib.sha256(Path(tmp).read_bytes()).digest() != digest:
-            raise BootstrapError("Ошибка контрольной суммы исходников")
+        if get_installed_version(Path(tmp)) != bundled_version:
+            raise BootstrapError("Неверная контрольная сумма исходников")
         os.replace(tmp, target)
     finally:
         Path(tmp).unlink(missing_ok=True)
