@@ -1,0 +1,77 @@
+name: Build lightweight Windows bootstrapper
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feature/mvp-voice-core]
+    paths:
+      - 'bootstrap/**'
+      - 'src/**'
+      - '.github/workflows/windows-light-installer.yml'
+      - 'tests/test_bootstrap.py'
+  pull_request:
+    paths:
+      - 'bootstrap/**'
+      - '.github/workflows/windows-light-installer.yml'
+      - 'tests/test_bootstrap.py'
+
+jobs:
+  windows-bootstrap:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "pyinstaller>=6.10,<7" "uv>=0.9,<1" "pytest>=8,<10"
+      - name: Test installer logic
+        shell: pwsh
+        run: python -m pytest -q tests/test_bootstrap.py
+      - name: Bundle application Python source
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          from zipfile import ZipFile, ZIP_DEFLATED
+          root = Path("src")
+          with ZipFile("voice_studio_source.zip", "w", compression=ZIP_DEFLATED) as z:
+              for f in sorted((root / "voice_studio").rglob("*.py")):
+                  z.write(f, f.relative_to(root).as_posix())
+          '@ | python -
+      - name: Build small EXE including uv and application code
+        shell: pwsh
+        run: |
+          $uvExe = python -c "import uv; print(uv.find_uv_bin())"
+          if (-not (Test-Path $uvExe)) { throw "uv.exe not found: $uvExe" }
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name VoiceStudioSetup --paths . `
+            --hidden-import bootstrap.core `
+            --add-binary "$uvExe;." `
+            --add-data "voice_studio_source.zip;." `
+            bootstrap/launcher.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Smoke-test packaged setup
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath ".\dist\VoiceStudioSetup.exe" -ArgumentList "--smoke" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Installer smoke failed: $($p.ExitCode)" }
+          Get-Item "dist\VoiceStudioSetup.exe" | Select-Object Name,Length
+          Get-FileHash "dist\VoiceStudioSetup.exe" -Algorithm SHA256 |
+            ForEach-Object { $_.Hash + "  VoiceStudioSetup.exe" } |
+            Set-Content "dist\SHA256SUMS.txt"
+      - name: Upload setup
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoiceStudio-Light-Installer-Windows-x64
+          path: |
+            dist/VoiceStudioSetup.exe
+            dist/SHA256SUMS.txt
+          retention-days: 14
+          if-no-files-found: error
