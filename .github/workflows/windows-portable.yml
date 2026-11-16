@@ -1,0 +1,87 @@
+name: Build Windows portable EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feature/mvp-voice-core]
+    paths:
+      - 'src/**'
+      - 'launcher.py'
+      - 'pyproject.toml'
+      - '.github/workflows/windows-portable.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'launcher.py'
+      - 'pyproject.toml'
+      - '.github/workflows/windows-portable.yml'
+
+jobs:
+  windows-portable:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+
+      - name: Install CUDA PyTorch runtime
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+      - name: Install GUI, Qwen inference and packager
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[gui,qwen]"
+          python -m pip install "pyinstaller>=6.10,<7" "pyinstaller-hooks-contrib>=2025.1"
+          python -c "import torch, qwen_tts, PySide6, huggingface_hub; print('torch', torch.__version__)"
+          python -m pip cache purge
+
+      - name: Pack all runtime modules into VoiceStudio.exe
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --onedir --windowed --name VoiceStudio --paths src `
+            --hidden-import voice_studio.engines `
+            --hidden-import voice_studio.pipeline `
+            --hidden-import voice_studio.importers `
+            --hidden-import voice_studio.model_manager `
+            --collect-all qwen_tts `
+            --collect-data transformers `
+            --collect-submodules transformers `
+            --collect-data huggingface_hub `
+            --collect-all soundfile `
+            --collect-all tokenizers `
+            launcher.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check packaged window launches without Python install
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          & ".\dist\VoiceStudio\VoiceStudio.exe" --smoke
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem ".\dist\VoiceStudio\VoiceStudio.exe" | Select-Object Name,Length
+
+      - name: Bundle README and checksum
+        shell: pwsh
+        run: |
+          Copy-Item "docs\09-portable-windows.md" "dist\VoiceStudio\HOW-TO-RUN.txt"
+          Get-FileHash ".\dist\VoiceStudio\VoiceStudio.exe" -Algorithm SHA256 |
+            ForEach-Object { $_.Hash + "  VoiceStudio.exe" } |
+            Set-Content ".\dist\VoiceStudio\SHA256SUMS.txt"
+
+      - name: Publish portable Windows archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoiceStudio-Windows-Portable-x64
+          path: dist/VoiceStudio/
+          retention-days: 14
+          compression-level: 0
+          if-no-files-found: error
