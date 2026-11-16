@@ -185,7 +185,7 @@ def main() -> None:
     class Window(QMainWindow):
         def __init__(self):
             super().__init__()
-            self.setWindowTitle("Voice Studio · локальная озвучка (прототип)")
+            self.setWindowTitle("Voice Studio 0.2 Alpha · русская озвучка")
             self.resize(900, 720)
             self.worker = None
             self.manager = ModelManager()
