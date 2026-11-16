@@ -32,6 +32,21 @@ def bundled_path(filename: str) -> Path:
     return directory / filename
 
 
+def displayed_version(root: Path) -> str:
+    """Show the actually installed app version, not merely setup.exe's age."""
+    try:
+        from bootstrap.source_update import get_installed_version
+        installed = root / "app-src.zip"
+        if installed.is_file():
+            return get_installed_version(installed)
+        bundled = bundled_path("voice_studio_source.zip")
+        if bundled.is_file():
+            return get_installed_version(bundled)
+    except (OSError, ValueError):
+        pass
+    return "не определена"
+
+
 class BootstrapWindow:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -46,7 +61,11 @@ class BootstrapWindow:
         self.status = tk.StringVar(value="Диагностика готовности…")
         self.details = tk.StringVar(value="")
         self.existing = tk.StringVar(value="")
+        self.version_display = tk.StringVar(value="Версия: проверяем…")
 
+        # Permanent bottom-right footer, independent of installation progress.
+        ttk.Label(root, textvariable=self.version_display,
+                  foreground="#666666").pack(side="bottom", anchor="e", padx=16, pady=(0, 8))
         box = ttk.Frame(root, padding=18)
         box.pack(fill="both", expand=True)
         ttk.Label(box, text="Voice Studio", font=("Segoe UI", 20, "bold")).pack(anchor="w")
@@ -77,6 +96,7 @@ class BootstrapWindow:
         self.root.after(150, self.drain)
 
     def refresh(self):
+        self.version_display.set("Voice Studio v" + displayed_version(self.rootdir))
         managed = probe_python(managed_python(self.rootdir))
         candidates = []
         for path in find_system_python():
