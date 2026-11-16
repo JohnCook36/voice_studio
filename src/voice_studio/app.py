@@ -6,6 +6,7 @@ from threading import Event
 
 from .licensing import BUILTIN_LICENSES, LicenseStatus
 from .pipeline import Job
+from .model_manager import ModelManager, ModelManagerError
 
 MODELS = tuple(BUILTIN_LICENSES)
 SPEAKERS = ("Ryan", "Aiden", "Serena", "Vivian", "Uncle_Fu", "Dylan", "Eric", "Ono_Anna", "Sohee")
@@ -21,7 +22,7 @@ def main() -> None:
         from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                        QHBoxLayout, QTextEdit, QLabel, QComboBox, QPushButton,
                                        QLineEdit, QCheckBox, QFileDialog, QMessageBox,
-                                       QProgressBar, QGroupBox)
+                                       QProgressBar, QGroupBox, QDialog)
     except ImportError as exc:
         raise SystemExit("Для графического интерфейса: pip install -e .[gui]") from exc
 
@@ -50,12 +51,140 @@ def main() -> None:
             except Exception as exc:
                 self.failure.emit(f"{type(exc).__name__}: {exc}")
 
+    class DownloadWorker(QThread):
+        success = Signal(str)
+        failure = Signal(str)
+
+        def __init__(self, manager: ModelManager, model_id: str):
+            super().__init__()
+            self.manager = manager
+            self.model_id = model_id
+
+        def run(self):
+            try:
+                self.success.emit(str(self.manager.download(self.model_id)))
+            except Exception as exc:
+                self.failure.emit(f"{type(exc).__name__}: {exc}")
+
+    class ManagerDialog(QDialog):
+        def __init__(self, manager: ModelManager, parent=None):
+            super().__init__(parent)
+            self.manager = manager
+            self.download_worker = None
+            self.setWindowTitle("Управление моделями – Voice Studio")
+            self.resize(630, 300)
+            layout = QVBoxLayout(self)
+            layout.addWidget(QLabel("Скачанные модели хранятся в: " + str(manager.root)))
+            self.selector = QComboBox()
+            for mid in MODELS:
+                self.selector.addItem(mid.split("12Hz-")[1], userData=mid)
+            self.selector.currentIndexChanged.connect(self.refresh)
+            layout.addWidget(self.selector)
+            self.size_status = QLabel()
+            self.size_status.setWordWrap(True)
+            layout.addWidget(self.size_status)
+            layout.addWidget(QLabel(
+                "Можно удалять только модели, скачанные через Voice Studio. "
+                "Чужие папки, голоса и аудиозаписи не затрагиваются."))
+            actions = QHBoxLayout()
+            self.download_btn = QPushButton("Скачать выбранную модель")
+            self.download_btn.clicked.connect(self.download_model)
+            actions.addWidget(self.download_btn)
+            self.delete_btn = QPushButton("Удалить выбранную модель")
+            self.delete_btn.clicked.connect(self.delete_model)
+            actions.addWidget(self.delete_btn)
+            self.refresh_btn = QPushButton("Обновить")
+            self.refresh_btn.clicked.connect(self.refresh)
+            actions.addWidget(self.refresh_btn)
+            layout.addLayout(actions)
+            self.message = QLabel()
+            self.message.setWordWrap(True)
+            layout.addWidget(self.message)
+            self.refresh()
+
+        def refresh(self):
+            try:
+                info = self.manager.info(self.selector.currentData())
+                status_names = {"not_downloaded": "Не загружена",
+                                "partial": "Неполная загрузка",
+                                "installed": "Загружена"}
+                gib = info.size_bytes / (1024 ** 3)
+                self.size_status.setText(
+                    f"Статус: {status_names[info.status]} | Занято: {gib:.2f} ГБ")
+                busy = self.download_worker is not None and self.download_worker.isRunning()
+                self.download_btn.setEnabled(not busy)
+                self.delete_btn.setEnabled(not busy and info.status != "not_downloaded"
+                                           and not (self.parent().worker and self.parent().worker.isRunning()))
+            except Exception as exc:
+                self.message.setText(str(exc))
+                self.download_btn.setEnabled(False)
+                self.delete_btn.setEnabled(False)
+
+        def download_model(self):
+            if self.download_worker and self.download_worker.isRunning():
+                return
+            model_id = self.selector.currentData()
+            if QMessageBox.question(
+                self, "Скачать модель",
+                f"Загрузить {model_id} из Hugging Face? Файлы могут занимать несколько ГБ. "
+                "Нужен интернет; коммерческие права этой ревизии пока не подтверждены.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            ) != QMessageBox.StandardButton.Yes:
+                return
+            self.download_worker = DownloadWorker(self.manager, model_id)
+            self.download_worker.success.connect(self.on_download_success)
+            self.download_worker.failure.connect(self.on_download_failure)
+            self.download_worker.finished.connect(self.refresh)
+            self.message.setText("Загрузка модели… Закрывать программу во время загрузки нельзя.")
+            self.download_btn.setEnabled(False)
+            self.delete_btn.setEnabled(False)
+            self.download_worker.start()
+
+        def on_download_success(self, path):
+            self.message.setText("Модель сохранена: " + path)
+            self.refresh()
+
+        def on_download_failure(self, error):
+            self.message.setText("Ошибка загрузки: " + error +
+                                 ". Неполные файлы можно удалить или попробовать скачать снова.")
+            self.refresh()
+
+        def delete_model(self):
+            model_id = self.selector.currentData()
+            if self.parent().worker and self.parent().worker.isRunning():
+                QMessageBox.warning(self, "Модель занята", "Дождитесь окончания озвучки")
+                return
+            try:
+                info = self.manager.info(model_id)
+                if info.status == "not_downloaded":
+                    return
+                if QMessageBox.question(
+                    self, "Удалить модель",
+                    f"Удалить модель {model_id}? Будут удалены только файлы в:\n{info.path}\n"
+                    f"Объём: {info.size_bytes / (1024 ** 3):.2f} ГБ. Отменить это действие нельзя.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                ) != QMessageBox.StandardButton.Yes:
+                    return
+                freed = self.manager.delete(model_id)
+                self.message.setText(f"Удалено: {freed / (1024 ** 3):.2f} ГБ")
+                self.refresh()
+            except Exception as exc:
+                QMessageBox.warning(self, "Ошибка удаления", str(exc))
+
+        def closeEvent(self, event):
+            if self.download_worker and self.download_worker.isRunning():
+                QMessageBox.warning(self, "Идёт загрузка", "Дождитесь окончания загрузки модели")
+                event.ignore()
+            else:
+                event.accept()
+
     class Window(QMainWindow):
         def __init__(self):
             super().__init__()
             self.setWindowTitle("Voice Studio · локальная озвучка (прототип)")
             self.resize(900, 720)
             self.worker = None
+            self.manager = ModelManager()
             self.player = QMediaPlayer(self)
             self.audio_output = QAudioOutput(self)
             self.player.setAudioOutput(self.audio_output)
@@ -82,15 +211,22 @@ def main() -> None:
             self.speakers = QComboBox()
             self.speakers.addItems(SPEAKERS)
             line2.addWidget(self.speakers)
-            line2.addWidget(QLabel("Папка весов (необязательно):"))
+            line2.addWidget(QLabel("Внешняя папка (необязательно):"))
             self.model_dir = QLineEdit()
+            self.model_dir.setPlaceholderText("Внешние модели здесь не удаляются")
             line2.addWidget(self.model_dir, 1)
             b = QPushButton("…")
             b.clicked.connect(self.choose_model_dir)
             line2.addWidget(b)
             layout.addLayout(line2)
-            self.download = QCheckBox("Разрешить скачивание модели из Hugging Face (несколько ГБ)")
-            layout.addWidget(self.download)
+            model_line = QHBoxLayout()
+            self.model_status = QLabel()
+            model_line.addWidget(self.model_status, 1)
+            self.manage_btn = QPushButton("Модели: скачать / удалить")
+            self.manage_btn.clicked.connect(self.open_model_manager)
+            model_line.addWidget(self.manage_btn)
+            layout.addLayout(model_line)
+            self.models.currentIndexChanged.connect(self.update_model_status)
             clone_box = QGroupBox("Клонирование: только свой или разрешённый голос (Base)")
             clone_layout = QVBoxLayout(clone_box)
             refline = QHBoxLayout()
@@ -136,6 +272,25 @@ def main() -> None:
             self.status.setWordWrap(True)
             layout.addWidget(self.status)
             self.check_license()
+            self.update_model_status()
+
+        def update_model_status(self):
+            try:
+                model = self.models.currentData()
+                info = self.manager.info(model)
+                human = {"installed": "скачана", "partial": "неполная загрузка",
+                         "not_downloaded": "не скачана"}[info.status]
+                self.model_status.setText(f"Выбранная модель: {human}, {info.size_bytes / (1024 ** 3):.2f} ГБ")
+            except Exception as exc:
+                self.model_status.setText("Ошибка списка моделей: " + str(exc))
+
+        def open_model_manager(self):
+            if self.worker and self.worker.isRunning():
+                QMessageBox.information(self, "Модели", "Остановите озвучку перед управлением моделями")
+                return
+            dialog = ManagerDialog(self.manager, self)
+            dialog.exec()
+            self.update_model_status()
 
         def check_license(self):
             record = BUILTIN_LICENSES[self.models.currentData()]
@@ -178,15 +333,18 @@ def main() -> None:
             if model.endswith("-Base") and (not self.ref_path.text().strip() or not self.ref_text.text().strip() or not self.consent.isChecked()):
                 QMessageBox.warning(self, "Голос", "Для Base нужны WAV, текст образца и подтверждение согласия")
                 return
-            if not self.model_dir.text().strip() and not self.download.isChecked():
-                QMessageBox.warning(self, "Модель", "Укажите локальную папку или разрешите скачивание")
-                return
-            if not self.model_dir.text().strip():
-                result = QMessageBox.question(self, "Загрузка весов",
-                    "Модель может занимать несколько ГБ. Начать скачивание?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                if result != QMessageBox.StandardButton.Yes:
+            local_model = self.model_dir.text().strip()
+            if not local_model:
+                try:
+                    info = self.manager.info(model)
+                except ModelManagerError as exc:
+                    QMessageBox.warning(self, "Модель", str(exc))
                     return
+                if info.status != "installed":
+                    QMessageBox.warning(self, "Модель не скачана",
+                        "Откройте «Модели: скачать / удалить» и скачайте выбранную модель.")
+                    return
+                local_model = str(info.path)
             output, _ = QFileDialog.getSaveFileName(self, "Сохранить озвучку",
                                                     "voice_studio.wav", "WAV (*.wav);;MP3 (*.mp3)")
             if not output:
@@ -195,7 +353,7 @@ def main() -> None:
             job = Job(model, self.editor.toPlainText(), Path(output),
                       speaker=self.speakers.currentText(), commercial=self.commercial.isChecked(),
                       reference=ref, reference_text=self.ref_text.text(), voice_consent=self.consent.isChecked())
-            self.worker = Worker(job, self.model_dir.text(), self.download.isChecked())
+            self.worker = Worker(job, local_model, False)
             self.worker.progress.connect(self.on_progress)
             self.worker.success.connect(self.on_success)
             self.worker.failure.connect(self.on_failure)
