@@ -97,7 +97,7 @@ def test_tampered_download_refused_and_previous_version_preserved(tmp_path):
     root = tmp_path / "user"
     install_source_zip(old, root)
     info = info_for(raw)
-    with pytest.raises(UpdateError, match="контрольная сумма"):
+    with pytest.raises(UpdateError, match="Контрольная сумма"):
         stage_update(info, root, "0.2.0a1", opener=lambda *a, **kw: BytesIO(raw[:-1] + bytes([raw[-1] ^ 1])))
     assert get_installed_version(root / "app-src.zip") == "0.2.0a1"
     assert not (root / UPDATE_PENDING).exists()
