@@ -189,30 +189,27 @@ def install_source_zip(resource: Path, root: Path) -> Path:
     The small setup EXE contains the version originally bundled with it.
     Blindly copying it on every launch would undo in-app updates.
     """
-    from voice_studio.updater import apply_pending_update, get_installed_version, version_key, UpdateError
+    from .source_update import apply_pending_update, get_installed_version, version_key, SourceUpdateError
 
     if not resource.is_file():
         raise BootstrapError("В установщике отсутствует исходный пакет Voice Studio")
     try:
         bundled_version = get_installed_version(resource)
-    except UpdateError as exc:
+    except SourceUpdateError as exc:
         raise BootstrapError(str(exc)) from exc
 
     root.mkdir(parents=True, exist_ok=True)
     target = root / "app-src.zip"
 
-    # Important: bootstrap core must be able to read the updater from a
-    # bundled bootstrap module (see separate bootstrap/updater_core.py). The
-    # following import is replaced with that independent copy below.
     try:
         apply_pending_update(root)
-    except UpdateError as exc:
+    except SourceUpdateError as exc:
         raise BootstrapError("Проверка обновления не прошла: " + str(exc)) from exc
 
     if target.is_file():
         try:
             installed_version = get_installed_version(target)
-        except UpdateError as exc:
+        except SourceUpdateError as exc:
             raise BootstrapError("Установленная версия повреждена: " + str(exc)) from exc
         if version_key(installed_version) >= version_key(bundled_version):
             return target
