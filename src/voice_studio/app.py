@@ -1,0 +1,617 @@
+"""PySide6 desktop shell; never initializes heavy models on startup."""
+import argparse
+from pathlib import Path
+import sys
+from threading import Event
+
+from .licensing import BUILTIN_LICENSES, LicenseStatus
+from .pipeline import Job
+from .model_manager import ModelManager, ModelManagerError
+from .pronunciation import load_dictionary, PronunciationError
+from . import __version__
+
+MODELS = tuple(BUILTIN_LICENSES)
+from .voice_profiles import VOICE_PROFILES
+
+SPEAKERS = tuple(VOICE_PROFILES)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Voice Studio")
+    parser.add_argument("--smoke", action="store_true", help="Проверить запуск окна без моделей")
+    opts = parser.parse_args()
+    try:
+        from PySide6.QtCore import QThread, Signal, QTimer, QUrl, Qt
+        from PySide6.QtGui import QTextCursor
+        from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+        from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                                       QHBoxLayout, QTextEdit, QLabel, QComboBox, QPushButton,
+                                       QLineEdit, QCheckBox, QFileDialog, QMessageBox,
+                                       QProgressBar, QGroupBox, QDialog, QSlider, QInputDialog)
+    except ImportError as exc:
+        raise SystemExit("Для графического интерфейса: pip install -e .[gui]") from exc
+
+    class Worker(QThread):
+        progress = Signal(int, int)
+        success = Signal(str)
+        failure = Signal(str)
+
+        def __init__(self, job: Job, local_model: str, allow_download: bool):
+            super().__init__()
+            self.job = job
+            self.local_model = local_model
+            self.allow_download = allow_download
+            self.stop = Event()
+
+        def run(self):
+            try:
+                from .engines import QwenEngine
+                from .pipeline import render
+                engine = QwenEngine(self.job.model_id, local_model=self.local_model,
+                                    download_allowed=self.allow_download)
+                path = render(self.job, BUILTIN_LICENSES[self.job.model_id], engine,
+                              progress=lambda done, total: self.progress.emit(done, total),
+                              cancelled=self.stop.is_set)
+                self.success.emit(str(path))
+            except Exception as exc:
+                self.failure.emit(f"{type(exc).__name__}: {exc}")
+
+    class DownloadWorker(QThread):
+        success = Signal(str)
+        failure = Signal(str)
+
+        def __init__(self, manager: ModelManager, model_id: str):
+            super().__init__()
+            self.manager = manager
+            self.model_id = model_id
+
+        def run(self):
+            try:
+                self.success.emit(str(self.manager.download(self.model_id)))
+            except Exception as exc:
+                self.failure.emit(f"{type(exc).__name__}: {exc}")
+
+    class ManagerDialog(QDialog):
+        def __init__(self, manager: ModelManager, parent=None):
+            super().__init__(parent)
+            self.manager = manager
+            self.download_worker = None
+            self.setWindowTitle("Управление моделями – Voice Studio")
+            self.resize(630, 300)
+            layout = QVBoxLayout(self)
+            layout.addWidget(QLabel("Скачанные модели хранятся в: " + str(manager.root)))
+            self.selector = QComboBox()
+            for mid in MODELS:
+                self.selector.addItem(mid.split("12Hz-")[1], userData=mid)
+            self.selector.currentIndexChanged.connect(self.refresh)
+            layout.addWidget(self.selector)
+            self.size_status = QLabel()
+            self.size_status.setWordWrap(True)
+            layout.addWidget(self.size_status)
+            layout.addWidget(QLabel(
+                "Можно удалять только модели, скачанные через Voice Studio. "
+                "Чужие папки, голоса и аудиозаписи не затрагиваются."))
+            actions = QHBoxLayout()
+            self.download_btn = QPushButton("Скачать выбранную модель")
+            self.download_btn.clicked.connect(self.download_model)
+            actions.addWidget(self.download_btn)
+            self.delete_btn = QPushButton("Удалить выбранную модель")
+            self.delete_btn.clicked.connect(self.delete_model)
+            actions.addWidget(self.delete_btn)
+            self.refresh_btn = QPushButton("Обновить")
+            self.refresh_btn.clicked.connect(self.refresh)
+            actions.addWidget(self.refresh_btn)
+            layout.addLayout(actions)
+            self.message = QLabel()
+            self.message.setWordWrap(True)
+            layout.addWidget(self.message)
+            self.refresh()
+
+        def refresh(self):
+            try:
+                info = self.manager.info(self.selector.currentData())
+                status_names = {"not_downloaded": "Не загружена",
+                                "partial": "Неполная загрузка",
+                                "installed": "Загружена"}
+                gib = info.size_bytes / (1024 ** 3)
+                self.size_status.setText(
+                    f"Статус: {status_names[info.status]} | Занято: {gib:.2f} ГБ")
+                busy = self.download_worker is not None and self.download_worker.isRunning()
+                self.download_btn.setEnabled(not busy)
+                self.delete_btn.setEnabled(not busy and info.status != "not_downloaded"
+                                           and not (self.parent().worker and self.parent().worker.isRunning()))
+            except Exception as exc:
+                self.message.setText(str(exc))
+                self.download_btn.setEnabled(False)
+                self.delete_btn.setEnabled(False)
+
+        def download_model(self):
+            if self.download_worker and self.download_worker.isRunning():
+                return
+            model_id = self.selector.currentData()
+            if QMessageBox.question(
+                self, "Скачать модель",
+                f"Загрузить {model_id} из Hugging Face? Файлы могут занимать несколько ГБ. "
+                "Нужен интернет; коммерческие права этой ревизии пока не подтверждены.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            ) != QMessageBox.StandardButton.Yes:
+                return
+            self.download_worker = DownloadWorker(self.manager, model_id)
+            self.download_worker.success.connect(self.on_download_success)
+            self.download_worker.failure.connect(self.on_download_failure)
+            self.download_worker.finished.connect(self.refresh)
+            self.message.setText("Загрузка модели… Закрывать программу во время загрузки нельзя.")
+            self.download_btn.setEnabled(False)
+            self.delete_btn.setEnabled(False)
+            self.download_worker.start()
+
+        def on_download_success(self, path):
+            self.message.setText("Модель сохранена: " + path)
+            self.refresh()
+
+        def on_download_failure(self, error):
+            self.message.setText("Ошибка загрузки: " + error +
+                                 ". Неполные файлы можно удалить или попробовать скачать снова.")
+            self.refresh()
+
+        def delete_model(self):
+            model_id = self.selector.currentData()
+            if self.parent().worker and self.parent().worker.isRunning():
+                QMessageBox.warning(self, "Модель занята", "Дождитесь окончания озвучки")
+                return
+            try:
+                info = self.manager.info(model_id)
+                if info.status == "not_downloaded":
+                    return
+                if QMessageBox.question(
+                    self, "Удалить модель",
+                    f"Удалить модель {model_id}? Будут удалены только файлы в:\n{info.path}\n"
+                    f"Объём: {info.size_bytes / (1024 ** 3):.2f} ГБ. Отменить это действие нельзя.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                ) != QMessageBox.StandardButton.Yes:
+                    return
+                freed = self.manager.delete(model_id)
+                self.message.setText(f"Удалено: {freed / (1024 ** 3):.2f} ГБ")
+                self.refresh()
+            except Exception as exc:
+                QMessageBox.warning(self, "Ошибка удаления", str(exc))
+
+        def closeEvent(self, event):
+            if self.download_worker and self.download_worker.isRunning():
+                QMessageBox.warning(self, "Идёт загрузка", "Дождитесь окончания загрузки модели")
+                event.ignore()
+            else:
+                event.accept()
+
+    class UpdateWorker(QThread):
+        found = Signal(object)
+        installed = Signal(str)
+        failed = Signal(str)
+
+        def __init__(self, mode: str, release=None):
+            super().__init__()
+            self.mode = mode
+            self.release = release
+
+        def run(self):
+            try:
+                from .updater import check_update, stage_update
+                from .model_manager import default_models_root
+                if self.mode == "check":
+                    self.found.emit(check_update(__version__))
+                else:
+                    root = default_models_root().parent
+                    staged = stage_update(self.release, root, __version__)
+                    self.installed.emit(str(staged))
+            except Exception as exc:
+                self.failed.emit(str(exc))
+
+    class Window(QMainWindow):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("Voice Studio 0.2 Alpha · русская озвучка")
+            self.resize(900, 720)
+            self.worker = None
+            self.manager = ModelManager()
+            self.update_worker = None
+            self.update_manual = False
+            self.available_update = None
+            self.player = QMediaPlayer(self)
+            self.audio_output = QAudioOutput(self)
+            self.player.setAudioOutput(self.audio_output)
+            self.audio_output.setVolume(0.8)
+            box = QWidget()
+            self.setCentralWidget(box)
+            layout = QVBoxLayout(box)
+            layout.addWidget(QLabel("Текст на русском. Теги: [emotion=sad], [pause=500ms], [speaker=Ryan]."))
+            self.editor = QTextEdit()
+            self.editor.setPlaceholderText("Вставьте текст для озвучки…")
+            layout.addWidget(self.editor)
+            line = QHBoxLayout()
+            self.open_btn = QPushButton("Загрузить TXT/DOCX")
+            self.open_btn.clicked.connect(self.open_document)
+            line.addWidget(self.open_btn)
+            line.addWidget(QLabel("Модель:"))
+            self.models = QComboBox()
+            for m in MODELS:
+                self.models.addItem(m.split("12Hz-")[1], userData=m)
+            line.addWidget(self.models, 1)
+            layout.addLayout(line)
+            line2 = QHBoxLayout()
+            line2.addWidget(QLabel("Голос:"))
+            self.speakers = QComboBox()
+            self.speakers.addItems(SPEAKERS)
+            line2.addWidget(self.speakers)
+            line2.addWidget(QLabel("Внешняя папка (необязательно):"))
+            self.model_dir = QLineEdit()
+            self.model_dir.setPlaceholderText("Внешние модели здесь не удаляются")
+            line2.addWidget(self.model_dir, 1)
+            b = QPushButton("…")
+            b.clicked.connect(self.choose_model_dir)
+            line2.addWidget(b)
+            layout.addLayout(line2)
+            model_line = QHBoxLayout()
+            self.model_status = QLabel()
+            model_line.addWidget(self.model_status, 1)
+            self.manage_btn = QPushButton("Модели: скачать / удалить")
+            self.manage_btn.clicked.connect(self.open_model_manager)
+            model_line.addWidget(self.manage_btn)
+            layout.addLayout(model_line)
+            self.models.currentIndexChanged.connect(self.update_model_status)
+
+            # The global pace applies to actual exported audio, not only playback.
+            pace = QHBoxLayout()
+            pace.addWidget(QLabel("Скорость чтения:"))
+            self.speed_slider = QSlider(Qt.Orientation.Horizontal)
+            self.speed_slider.setRange(65, 130)
+            self.speed_slider.setSingleStep(5)
+            self.speed_slider.setPageStep(5)
+            self.speed_slider.setTickInterval(10)
+            self.speed_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+            self.speed_slider.setValue(85)
+            self.speed_display = QLabel("0,85× · медленнее")
+            self.speed_slider.valueChanged.connect(self.update_speed_label)
+            pace.addWidget(self.speed_slider, 1)
+            pace.addWidget(self.speed_display)
+            layout.addLayout(pace)
+
+            voice_actions = QHBoxLayout()
+            self.preview_btn = QPushButton("🎧 Послушать все 9 голосов")
+            self.preview_btn.clicked.connect(self.open_voice_previews)
+            voice_actions.addWidget(self.preview_btn)
+            self.pron_btn = QPushButton("Словарь произношения")
+            self.pron_btn.clicked.connect(self.open_pronunciation)
+            voice_actions.addWidget(self.pron_btn)
+            self.accent_btn = QPushButton("Ударение выделенного слова")
+            self.accent_btn.clicked.connect(self.mark_stress)
+            voice_actions.addWidget(self.accent_btn)
+            layout.addLayout(voice_actions)
+
+            clone_box = QGroupBox("Клонирование: только свой или разрешённый голос (Base)")
+            clone_layout = QVBoxLayout(clone_box)
+            refline = QHBoxLayout()
+            self.ref_path = QLineEdit()
+            self.ref_path.setPlaceholderText("Путь к референсному WAV")
+            refline.addWidget(self.ref_path)
+            btn = QPushButton("Выбрать WAV")
+            btn.clicked.connect(self.choose_reference)
+            refline.addWidget(btn)
+            clone_layout.addLayout(refline)
+            self.ref_text = QLineEdit()
+            self.ref_text.setPlaceholderText("Точная расшифровка аудиообразца")
+            clone_layout.addWidget(self.ref_text)
+            self.consent = QCheckBox("Это мой голос либо у меня есть разрешение владельца")
+            clone_layout.addWidget(self.consent)
+            layout.addWidget(clone_box)
+            self.commercial = QCheckBox("Коммерческое использование (только проверенные лицензии)")
+            self.commercial.toggled.connect(self.check_license)
+            self.models.currentIndexChanged.connect(self.check_license)
+            layout.addWidget(self.commercial)
+            self.license_label = QLabel()
+            layout.addWidget(self.license_label)
+            controls = QHBoxLayout()
+            self.start_btn = QPushButton("Озвучить и сохранить WAV/MP3")
+            self.start_btn.clicked.connect(self.start)
+            controls.addWidget(self.start_btn)
+            self.cancel_btn = QPushButton("Остановить")
+            self.cancel_btn.setEnabled(False)
+            self.cancel_btn.clicked.connect(self.cancel)
+            controls.addWidget(self.cancel_btn)
+            self.play_btn = QPushButton("▶ Прослушать готовое")
+            self.play_btn.setEnabled(False)
+            self.play_btn.clicked.connect(self.play_last)
+            controls.addWidget(self.play_btn)
+            self.pause_btn = QPushButton("⏸ Пауза")
+            self.pause_btn.clicked.connect(self.player.pause)
+            controls.addWidget(self.pause_btn)
+            layout.addLayout(controls)
+            self.bar = QProgressBar()
+            self.bar.setRange(0, 1)
+            layout.addWidget(self.bar)
+            self.status = QLabel("Готово к работе. Для MP3 нужен ffmpeg в PATH.")
+            self.status.setWordWrap(True)
+            layout.addWidget(self.status)
+
+            # Fixed bottom status bar: visible even when text/editor scrolls.
+            self.version_label = QLabel(f"Voice Studio v{__version__} · Alpha")
+            self.version_label.setToolTip("Установленная версия приложения")
+            self.statusBar().addPermanentWidget(self.version_label)
+            self.update_label = QLabel("Обновления: не проверялись")
+            self.statusBar().addWidget(self.update_label, 1)
+            self.update_button = QPushButton("Проверить обновления")
+            self.update_button.clicked.connect(self.check_updates_manual)
+            self.statusBar().addPermanentWidget(self.update_button)
+
+            self.check_license()
+            self.update_model_status()
+            QTimer.singleShot(1500, self.check_updates_auto)
+
+        def check_updates_auto(self):
+            self.start_update_check(manual=False)
+
+        def check_updates_manual(self):
+            self.start_update_check(manual=True)
+
+        def start_update_check(self, manual=False):
+            if self.update_worker and self.update_worker.isRunning():
+                return
+            self.update_manual = manual
+            self.update_button.setEnabled(False)
+            self.update_label.setText("Проверяем GitHub Releases…")
+            self.update_worker = UpdateWorker("check")
+            self.update_worker.found.connect(self.on_update_result)
+            self.update_worker.failed.connect(self.on_update_error)
+            self.update_worker.finished.connect(self.on_update_finished)
+            self.update_worker.start()
+
+        def on_update_result(self, info):
+            self.available_update = info
+            if info is None:
+                self.update_label.setText("Установлена актуальная опубликованная версия")
+                if self.update_manual:
+                    QMessageBox.information(self, "Обновления",
+                                            "Более новой опубликованной версии пока нет.")
+                return
+            self.update_label.setText(f"Доступна новая версия {info.version}")
+            answer = QMessageBox.question(
+                self, "Доступно обновление Voice Studio",
+                f"Установлена: {__version__}\\nДоступна: {info.version}\\n"
+                f"Размер обновления приложения: {info.size / 1024 / 1024:.1f} МБ\\n\\n"
+                "Скачать обновление? Модели, библиотеки CUDA, голоса и ваши книги сохранятся. "
+                "Для применения потребуется перезапуск Voice Studio.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if answer == QMessageBox.StandardButton.Yes:
+                self.start_update_download(info)
+
+        def start_update_download(self, info):
+            if self.update_worker and self.update_worker.isRunning():
+                # A QThread cannot be replaced while it is still running.
+                QTimer.singleShot(150, lambda: self.start_update_download(info))
+                return
+            self.update_label.setText("Загружаем обновление…")
+            self.update_button.setEnabled(False)
+            self.update_worker = UpdateWorker("download", info)
+            self.update_worker.installed.connect(self.on_update_downloaded)
+            self.update_worker.failed.connect(self.on_update_error)
+            self.update_worker.finished.connect(self.on_update_finished)
+            self.update_worker.start()
+
+        def on_update_downloaded(self, path):
+            self.update_label.setText("Обновление скачано · требуется перезапуск")
+            QMessageBox.information(
+                self, "Обновление готово",
+                "Новая версия проверена и сохранена.\\n\\n"
+                "Завершите озвучку, закройте Voice Studio и снова откройте "
+                "VoiceStudioSetup.exe. Он применит обновление без повторной загрузки "
+                "нейросети, CUDA и моделей.")
+
+        def on_update_error(self, message):
+            self.update_label.setText("Не удалось проверить или скачать обновление")
+            if self.update_manual or (self.update_worker and self.update_worker.mode == "download"):
+                QMessageBox.warning(self, "Обновление Voice Studio", message)
+
+        def on_update_finished(self):
+            self.update_button.setEnabled(True)
+
+        def update_speed_label(self, value: int):
+            rate = value / 100
+            mood = "медленнее" if rate < 1 else ("обычно" if rate == 1 else "быстрее")
+            self.speed_display.setText(f"{rate:.2f}× · {mood}".replace(".", ","))
+
+        def open_pronunciation(self):
+            from .gui_narration import PronunciationDialog
+            PronunciationDialog(self).exec()
+
+        def mark_stress(self):
+            from .pronunciation import stress_variants
+            cursor = self.editor.textCursor()
+            if not cursor.hasSelection():
+                cursor.select(QTextCursor.SelectionType.WordUnderCursor)
+            word = cursor.selectedText()
+            choices = stress_variants(word)
+            if not choices:
+                QMessageBox.information(self, "Ударение",
+                    "Выделите одно русское слово либо поставьте курсор внутри слова.")
+                return
+            chosen, accepted = QInputDialog.getItem(self, "Ударение",
+                "Выберите ударную гласную. Qwen может проигнорировать этот знак:", choices, 0, False)
+            if accepted:
+                cursor.insertText(chosen)
+                self.editor.setTextCursor(cursor)
+
+        def open_voice_previews(self):
+            from .gui_narration import VoicePreviewDialog
+            if self.worker and self.worker.isRunning():
+                QMessageBox.information(self, "Голоса", "Дождитесь окончания текущей озвучки")
+                return
+            model = self.models.currentData()
+            if not model.endswith("-CustomVoice"):
+                QMessageBox.information(self, "Голоса", "Готовые голоса доступны в CustomVoice. Base требует образец вашего голоса.")
+                return
+            model_path = self.model_dir.text().strip()
+            if not model_path:
+                try:
+                    info = self.manager.info(model)
+                    if info.status != "installed":
+                        QMessageBox.information(self, "Модель не скачана", "Сначала скачайте выбранную модель CustomVoice.")
+                        return
+                    model_path = str(info.path)
+                except ModelManagerError as exc:
+                    QMessageBox.warning(self, "Модели", str(exc))
+                    return
+            try:
+                rules = load_dictionary()
+            except PronunciationError as exc:
+                QMessageBox.warning(self, "Словарь", str(exc))
+                return
+            dialog = VoicePreviewDialog(model, model_path, self.speed_slider.value() / 100, rules, self)
+            dialog.exec()
+
+        def update_model_status(self):
+            try:
+                model = self.models.currentData()
+                self.preview_btn.setEnabled(bool(model and model.endswith("-CustomVoice")))
+                info = self.manager.info(model)
+                human = {"installed": "скачана", "partial": "неполная загрузка",
+                         "not_downloaded": "не скачана"}[info.status]
+                self.model_status.setText(f"Выбранная модель: {human}, {info.size_bytes / (1024 ** 3):.2f} ГБ")
+            except Exception as exc:
+                self.model_status.setText("Ошибка списка моделей: " + str(exc))
+
+        def open_model_manager(self):
+            if self.worker and self.worker.isRunning():
+                QMessageBox.information(self, "Модели", "Остановите озвучку перед управлением моделями")
+                return
+            dialog = ManagerDialog(self.manager, self)
+            dialog.exec()
+            self.update_model_status()
+
+        def check_license(self):
+            record = BUILTIN_LICENSES[self.models.currentData()]
+            allowed = not self.commercial.isChecked() or record.status == LicenseStatus.COMMERCIAL_ALLOWED
+            self.start_btn.setEnabled(allowed and not (self.worker and self.worker.isRunning()))
+            self.license_label.setText("Лицензия: " + record.status.value + ". " +
+                                       ("Коммерческая генерация заблокирована до аудита." if not allowed
+                                        else "Не используйте аудио коммерчески без проверки лицензии."))
+
+        def open_document(self):
+            from .importers import load_text
+            path, _ = QFileDialog.getOpenFileName(self, "Открыть текст", "", "Текст (*.txt *.docx)")
+            if path:
+                try:
+                    self.editor.setPlainText(load_text(Path(path)))
+                except Exception as exc:
+                    QMessageBox.warning(self, "Ошибка импорта", str(exc))
+
+        def choose_model_dir(self):
+            path = QFileDialog.getExistingDirectory(self, "Папка локальной модели")
+            if path:
+                self.model_dir.setText(path)
+
+        def choose_reference(self):
+            path, _ = QFileDialog.getOpenFileName(self, "Голосовой образец", "", "Аудио (*.wav)")
+            if path:
+                self.ref_path.setText(path)
+
+        def start(self):
+            from .licensing import authorize
+            model = self.models.currentData()
+            try:
+                authorize(BUILTIN_LICENSES[model], model, self.commercial.isChecked())
+            except Exception as exc:
+                QMessageBox.warning(self, "Лицензия", str(exc))
+                return
+            if not self.editor.toPlainText().strip():
+                QMessageBox.warning(self, "Текст", "Введите текст")
+                return
+            if model.endswith("-Base") and (not self.ref_path.text().strip() or not self.ref_text.text().strip() or not self.consent.isChecked()):
+                QMessageBox.warning(self, "Голос", "Для Base нужны WAV, текст образца и подтверждение согласия")
+                return
+            local_model = self.model_dir.text().strip()
+            if not local_model:
+                try:
+                    info = self.manager.info(model)
+                except ModelManagerError as exc:
+                    QMessageBox.warning(self, "Модель", str(exc))
+                    return
+                if info.status != "installed":
+                    QMessageBox.warning(self, "Модель не скачана",
+                        "Откройте «Модели: скачать / удалить» и скачайте выбранную модель.")
+                    return
+                local_model = str(info.path)
+            output, _ = QFileDialog.getSaveFileName(self, "Сохранить озвучку",
+                                                    "voice_studio.wav", "WAV (*.wav);;MP3 (*.mp3)")
+            if not output:
+                return
+            ref = Path(self.ref_path.text()) if model.endswith("-Base") else None
+            try:
+                pronunciations = load_dictionary()
+            except PronunciationError as exc:
+                QMessageBox.warning(self, "Словарь", str(exc))
+                return
+            job = Job(model, self.editor.toPlainText(), Path(output),
+                      speaker=self.speakers.currentText(), commercial=self.commercial.isChecked(),
+                      reference=ref, reference_text=self.ref_text.text(), voice_consent=self.consent.isChecked(),
+                      speed=self.speed_slider.value() / 100,
+                      pronunciations=tuple(sorted(pronunciations.items())))
+            self.worker = Worker(job, local_model, False)
+            self.worker.progress.connect(self.on_progress)
+            self.worker.success.connect(self.on_success)
+            self.worker.failure.connect(self.on_failure)
+            self.worker.finished.connect(self.on_finished)
+            self.bar.setRange(0, 0)
+            self.status.setText("Подготовка модели / генерация…")
+            self.start_btn.setEnabled(False)
+            self.cancel_btn.setEnabled(True)
+            self.worker.start()
+
+        def on_progress(self, current: int, total: int):
+            self.bar.setRange(0, total)
+            self.bar.setValue(current)
+            self.status.setText(f"Готово фрагментов: {current}/{total}")
+
+        def on_success(self, path: str):
+            self.player.setSource(QUrl.fromLocalFile(str(Path(path).resolve())))
+            self.play_btn.setEnabled(True)
+            self.status.setText(f"Сохранено: {path} + provenance.json")
+            QMessageBox.information(self, "Voice Studio", "Озвучка сохранена:\n" + path)
+
+        def on_failure(self, message: str):
+            self.status.setText(message)
+            QMessageBox.warning(self, "Ошибка озвучки", message)
+
+        def on_finished(self):
+            self.cancel_btn.setEnabled(False)
+            self.check_license()
+
+        def play_last(self):
+            if self.player.source().isValid():
+                self.player.play()
+
+        def cancel(self):
+            if self.worker:
+                self.worker.stop.set()
+                self.cancel_btn.setEnabled(False)
+                self.status.setText("Отмена после текущего фрагмента…")
+
+        def closeEvent(self, event):
+            if self.update_worker and self.update_worker.isRunning():
+                QMessageBox.information(self, "Обновление", "Дождитесь окончания проверки или скачивания обновления")
+                event.ignore()
+                return
+            if self.worker and self.worker.isRunning():
+                QMessageBox.information(self, "Voice Studio", "Сначала остановите генерацию")
+                event.ignore()
+            else:
+                event.accept()
+
+    app = QApplication(sys.argv[:1])
+    window = Window()
+    window.show()
+    if opts.smoke:
+        QTimer.singleShot(600, app.quit)
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
