@@ -21,7 +21,7 @@ def test_isolated_application_path(tmp_path):
 def test_source_zip_is_verified_and_reused(tmp_path):
     original = tmp_path / "source.zip"
     with ZipFile(original, "w") as archive:
-        archive.writestr("voice_studio/__init__.py", "")
+        archive.writestr("voice_studio/__init__.py", '__version__ = "0.2.0a1"')
         archive.writestr("voice_studio/app.py", "print('ok')")
     assert install_source_zip(original, tmp_path / "local").is_file()
     assert install_source_zip(original, tmp_path / "local") == tmp_path / "local" / "app-src.zip"
