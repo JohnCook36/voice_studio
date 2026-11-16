@@ -8,6 +8,7 @@ from .licensing import BUILTIN_LICENSES, LicenseStatus
 from .pipeline import Job
 from .model_manager import ModelManager, ModelManagerError
 from .pronunciation import load_dictionary, PronunciationError
+from . import __version__
 
 MODELS = tuple(BUILTIN_LICENSES)
 from .voice_profiles import VOICE_PROFILES
@@ -182,6 +183,29 @@ def main() -> None:
             else:
                 event.accept()
 
+    class UpdateWorker(QThread):
+        found = Signal(object)
+        installed = Signal(str)
+        failed = Signal(str)
+
+        def __init__(self, mode: str, release=None):
+            super().__init__()
+            self.mode = mode
+            self.release = release
+
+        def run(self):
+            try:
+                from .updater import check_update, stage_update
+                from .model_manager import default_models_root
+                if self.mode == "check":
+                    self.found.emit(check_update(__version__))
+                else:
+                    root = default_models_root().parent
+                    staged = stage_update(self.release, root, __version__)
+                    self.installed.emit(str(staged))
+            except Exception as exc:
+                self.failed.emit(str(exc))
+
     class Window(QMainWindow):
         def __init__(self):
             super().__init__()
@@ -189,6 +213,9 @@ def main() -> None:
             self.resize(900, 720)
             self.worker = None
             self.manager = ModelManager()
+            self.update_worker = None
+            self.update_manual = False
+            self.available_update = None
             self.player = QMediaPlayer(self)
             self.audio_output = QAudioOutput(self)
             self.player.setAudioOutput(self.audio_output)
@@ -304,8 +331,87 @@ def main() -> None:
             self.status = QLabel("Готово к работе. Для MP3 нужен ffmpeg в PATH.")
             self.status.setWordWrap(True)
             layout.addWidget(self.status)
+
+            # Fixed bottom status bar: visible even when text/editor scrolls.
+            self.version_label = QLabel(f"Voice Studio v{__version__} · Alpha")
+            self.version_label.setToolTip("Установленная версия приложения")
+            self.statusBar().addPermanentWidget(self.version_label)
+            self.update_label = QLabel("Обновления: не проверялись")
+            self.statusBar().addWidget(self.update_label, 1)
+            self.update_button = QPushButton("Проверить обновления")
+            self.update_button.clicked.connect(self.check_updates_manual)
+            self.statusBar().addPermanentWidget(self.update_button)
+
             self.check_license()
             self.update_model_status()
+            QTimer.singleShot(1500, self.check_updates_auto)
+
+        def check_updates_auto(self):
+            self.start_update_check(manual=False)
+
+        def check_updates_manual(self):
+            self.start_update_check(manual=True)
+
+        def start_update_check(self, manual=False):
+            if self.update_worker and self.update_worker.isRunning():
+                return
+            self.update_manual = manual
+            self.update_button.setEnabled(False)
+            self.update_label.setText("Проверяем GitHub Releases…")
+            self.update_worker = UpdateWorker("check")
+            self.update_worker.found.connect(self.on_update_result)
+            self.update_worker.failed.connect(self.on_update_error)
+            self.update_worker.finished.connect(self.on_update_finished)
+            self.update_worker.start()
+
+        def on_update_result(self, info):
+            self.available_update = info
+            if info is None:
+                self.update_label.setText("Установлена актуальная опубликованная версия")
+                if self.update_manual:
+                    QMessageBox.information(self, "Обновления",
+                                            "Более новой опубликованной версии пока нет.")
+                return
+            self.update_label.setText(f"Доступна новая версия {info.version}")
+            answer = QMessageBox.question(
+                self, "Доступно обновление Voice Studio",
+                f"Установлена: {__version__}\\nДоступна: {info.version}\\n"
+                f"Размер обновления приложения: {info.size / 1024 / 1024:.1f} МБ\\n\\n"
+                "Скачать обновление? Модели, библиотеки CUDA, голоса и ваши книги сохранятся. "
+                "Для применения потребуется перезапуск Voice Studio.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if answer == QMessageBox.StandardButton.Yes:
+                self.start_update_download(info)
+
+        def start_update_download(self, info):
+            if self.update_worker and self.update_worker.isRunning():
+                # A QThread cannot be replaced while it is still running.
+                QTimer.singleShot(150, lambda: self.start_update_download(info))
+                return
+            self.update_label.setText("Загружаем обновление…")
+            self.update_button.setEnabled(False)
+            self.update_worker = UpdateWorker("download", info)
+            self.update_worker.installed.connect(self.on_update_downloaded)
+            self.update_worker.failed.connect(self.on_update_error)
+            self.update_worker.finished.connect(self.on_update_finished)
+            self.update_worker.start()
+
+        def on_update_downloaded(self, path):
+            self.update_label.setText("Обновление скачано · требуется перезапуск")
+            QMessageBox.information(
+                self, "Обновление готово",
+                "Новая версия проверена и сохранена.\\n\\n"
+                "Завершите озвучку, закройте Voice Studio и снова откройте "
+                "VoiceStudioSetup.exe. Он применит обновление без повторной загрузки "
+                "нейросети, CUDA и моделей.")
+
+        def on_update_error(self, message):
+            self.update_label.setText("Не удалось проверить или скачать обновление")
+            if self.update_manual or (self.update_worker and self.update_worker.mode == "download"):
+                QMessageBox.warning(self, "Обновление Voice Studio", message)
+
+        def on_update_finished(self):
+            self.update_button.setEnabled(True)
 
         def update_speed_label(self, value: int):
             rate = value / 100
@@ -489,6 +595,10 @@ def main() -> None:
                 self.status.setText("Отмена после текущего фрагмента…")
 
         def closeEvent(self, event):
+            if self.update_worker and self.update_worker.isRunning():
+                QMessageBox.information(self, "Обновление", "Дождитесь окончания проверки или скачивания обновления")
+                event.ignore()
+                return
             if self.worker and self.worker.isRunning():
                 QMessageBox.information(self, "Voice Studio", "Сначала остановите генерацию")
                 event.ignore()
