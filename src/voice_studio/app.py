@@ -7,9 +7,12 @@ from threading import Event
 from .licensing import BUILTIN_LICENSES, LicenseStatus
 from .pipeline import Job
 from .model_manager import ModelManager, ModelManagerError
+from .pronunciation import load_dictionary, PronunciationError
 
 MODELS = tuple(BUILTIN_LICENSES)
-SPEAKERS = ("Ryan", "Aiden", "Serena", "Vivian", "Uncle_Fu", "Dylan", "Eric", "Ono_Anna", "Sohee")
+from .voice_profiles import VOICE_PROFILES
+
+SPEAKERS = tuple(VOICE_PROFILES)
 
 
 def main() -> None:
@@ -17,12 +20,12 @@ def main() -> None:
     parser.add_argument("--smoke", action="store_true", help="Проверить запуск окна без моделей")
     opts = parser.parse_args()
     try:
-        from PySide6.QtCore import QThread, Signal, QTimer, QUrl
+        from PySide6.QtCore import QThread, Signal, QTimer, QUrl, Qt
         from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
         from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                        QHBoxLayout, QTextEdit, QLabel, QComboBox, QPushButton,
                                        QLineEdit, QCheckBox, QFileDialog, QMessageBox,
-                                       QProgressBar, QGroupBox, QDialog)
+                                       QProgressBar, QGroupBox, QDialog, QSlider)
     except ImportError as exc:
         raise SystemExit("Для графического интерфейса: pip install -e .[gui]") from exc
 
@@ -227,6 +230,32 @@ def main() -> None:
             model_line.addWidget(self.manage_btn)
             layout.addLayout(model_line)
             self.models.currentIndexChanged.connect(self.update_model_status)
+
+            # The global pace applies to actual exported audio, not only playback.
+            pace = QHBoxLayout()
+            pace.addWidget(QLabel("Скорость чтения:"))
+            self.speed_slider = QSlider(Qt.Orientation.Horizontal)
+            self.speed_slider.setRange(65, 130)
+            self.speed_slider.setSingleStep(5)
+            self.speed_slider.setPageStep(5)
+            self.speed_slider.setTickInterval(10)
+            self.speed_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+            self.speed_slider.setValue(85)
+            self.speed_display = QLabel("0,85× · медленнее")
+            self.speed_slider.valueChanged.connect(self.update_speed_label)
+            pace.addWidget(self.speed_slider, 1)
+            pace.addWidget(self.speed_display)
+            layout.addLayout(pace)
+
+            voice_actions = QHBoxLayout()
+            self.preview_btn = QPushButton("🎧 Послушать все 9 голосов")
+            self.preview_btn.clicked.connect(self.open_voice_previews)
+            voice_actions.addWidget(self.preview_btn)
+            self.pron_btn = QPushButton("Словарь ударений и произношения")
+            self.pron_btn.clicked.connect(self.open_pronunciation)
+            voice_actions.addWidget(self.pron_btn)
+            layout.addLayout(voice_actions)
+
             clone_box = QGroupBox("Клонирование: только свой или разрешённый голос (Base)")
             clone_layout = QVBoxLayout(clone_box)
             refline = QHBoxLayout()
@@ -274,9 +303,47 @@ def main() -> None:
             self.check_license()
             self.update_model_status()
 
+        def update_speed_label(self, value: int):
+            rate = value / 100
+            mood = "медленнее" if rate < 1 else ("обычно" if rate == 1 else "быстрее")
+            self.speed_display.setText(f"{rate:.2f}× · {mood}".replace(".", ","))
+
+        def open_pronunciation(self):
+            from .gui_narration import PronunciationDialog
+            PronunciationDialog(self).exec()
+
+        def open_voice_previews(self):
+            from .gui_narration import VoicePreviewDialog
+            if self.worker and self.worker.isRunning():
+                QMessageBox.information(self, "Голоса", "Дождитесь окончания текущей озвучки")
+                return
+            model = self.models.currentData()
+            if not model.endswith("-CustomVoice"):
+                QMessageBox.information(self, "Голоса", "Готовые голоса доступны в CustomVoice. Base требует образец вашего голоса.")
+                return
+            model_path = self.model_dir.text().strip()
+            if not model_path:
+                try:
+                    info = self.manager.info(model)
+                    if info.status != "installed":
+                        QMessageBox.information(self, "Модель не скачана", "Сначала скачайте выбранную модель CustomVoice.")
+                        return
+                    model_path = str(info.path)
+                except ModelManagerError as exc:
+                    QMessageBox.warning(self, "Модели", str(exc))
+                    return
+            try:
+                rules = load_dictionary()
+            except PronunciationError as exc:
+                QMessageBox.warning(self, "Словарь", str(exc))
+                return
+            dialog = VoicePreviewDialog(model, model_path, self.speed_slider.value() / 100, rules, self)
+            dialog.exec()
+
         def update_model_status(self):
             try:
                 model = self.models.currentData()
+                self.preview_btn.setEnabled(bool(model and model.endswith("-CustomVoice")))
                 info = self.manager.info(model)
                 human = {"installed": "скачана", "partial": "неполная загрузка",
                          "not_downloaded": "не скачана"}[info.status]
@@ -350,9 +417,16 @@ def main() -> None:
             if not output:
                 return
             ref = Path(self.ref_path.text()) if model.endswith("-Base") else None
+            try:
+                pronunciations = load_dictionary()
+            except PronunciationError as exc:
+                QMessageBox.warning(self, "Словарь", str(exc))
+                return
             job = Job(model, self.editor.toPlainText(), Path(output),
                       speaker=self.speakers.currentText(), commercial=self.commercial.isChecked(),
-                      reference=ref, reference_text=self.ref_text.text(), voice_consent=self.consent.isChecked())
+                      reference=ref, reference_text=self.ref_text.text(), voice_consent=self.consent.isChecked(),
+                      speed=self.speed_slider.value() / 100,
+                      pronunciations=tuple(sorted(pronunciations.items())))
             self.worker = Worker(job, local_model, False)
             self.worker.progress.connect(self.on_progress)
             self.worker.success.connect(self.on_success)

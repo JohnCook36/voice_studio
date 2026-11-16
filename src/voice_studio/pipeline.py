@@ -11,6 +11,8 @@ from .audio import join_wavs, wav_rate, wav_to_mp3, write_wav
 from .engines import Engine
 from .licensing import LicenseRecord, authorize
 from .markup import Pause, Speech, parse
+from .pronunciation import apply_pronunciations, validate_rules
+from .tempo import change_tempo, validate_tempo
 
 
 class Cancelled(RuntimeError):
@@ -27,6 +29,8 @@ class Job:
     reference: Path | None = None
     reference_text: str = ""
     voice_consent: bool = False
+    speed: float = 1.0
+    pronunciations: tuple[tuple[str, str], ...] = ()
 
 
 def _json_atomic(path: Path, payload: dict) -> None:
@@ -65,8 +69,12 @@ def render(job: Job, license_record: LicenseRecord, engine: Engine,
     if job.model_id.endswith("-Base") and (not job.reference or not job.reference_text.strip()):
         raise ValueError("Для Base необходимы референс и текст образца")
 
+    global_speed = validate_tempo(job.speed)
+    rules = validate_rules(dict(job.pronunciations))
     events = parse(job.text, speaker=job.speaker)
     styles = [x.style for x in events if isinstance(x, Speech)]
+    for style in styles:
+        validate_tempo(global_speed * style.speed)
     if job.model_id.endswith("-Base") and len({x.speaker for x in styles}) > 1:
         raise ValueError("Для нескольких персонажей Base нужны отдельные голосовые профили; функция ещё не реализована")
     validator = getattr(engine, "validate_style", None)
@@ -86,7 +94,10 @@ def render(job: Job, license_record: LicenseRecord, engine: Engine,
         if isinstance(event, Pause):
             segments.append(event.milliseconds)
             continue
-        key_data = dict(text=event.text, style=asdict(event.style), model=job.model_id,
+        spoken_text = apply_pronunciations(event.text, rules)
+        effective_speed = global_speed * event.style.speed
+        key_data = dict(text=spoken_text, style=asdict(event.style), model=job.model_id,
+                        effective_speed=effective_speed, pronunciation_engine="dict-v1",
                         revision=license_record.weights_revision or "unverified",
                         license_status=license_record.status.value,
                         engine_source=getattr(engine, "cache_identity", job.model_id),
@@ -95,7 +106,8 @@ def render(job: Job, license_record: LicenseRecord, engine: Engine,
         key = hashlib.sha256(json.dumps(key_data, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
         wav = cache / (key + ".wav")
         if not wav.is_file():
-            audio = engine.synthesize(event.text, event.style, job.reference, job.reference_text)
+            audio = engine.synthesize(spoken_text, event.style, job.reference, job.reference_text)
+            audio = change_tempo(audio, effective_speed)
             write_wav(wav, audio)
         wav_rate(wav)
         segments.append(wav)
@@ -123,6 +135,7 @@ def render(job: Job, license_record: LicenseRecord, engine: Engine,
                 "weights_revision": license_record.weights_revision,
                 "license_evidence_url": license_record.evidence_url,
                 "reference_sha256": ref_sha, "segments": records,
-                "text_sha256": hashlib.sha256(job.text.encode("utf-8")).hexdigest()}
+                "text_sha256": hashlib.sha256(job.text.encode("utf-8")).hexdigest(),
+                "global_speed": global_speed, "pronunciation_rules_count": len(rules)}
     _json_atomic(job.output.with_suffix(job.output.suffix + ".provenance.json"), metadata)
     return job.output

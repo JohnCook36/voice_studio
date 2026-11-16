@@ -58,8 +58,8 @@ class QwenEngine:
 
     def validate_style(self, style: Style) -> None:
         is_base = self.model_id.endswith("-Base")
-        if style.speed != 1.0 or style.voice != "normal":
-            raise EngineError("Выбранный адаптер пока не поддерживает speed/whisper/shout")
+        if style.voice != "normal":
+            raise EngineError("Выбранный адаптер пока не поддерживает whisper/shout. Скорость меняется после синтеза.")
         if is_base and style.emotion != "neutral":
             raise EngineError("Base: управление эмоциями не подтверждено – используйте CustomVoice 1.7B")
         if not is_base and "0.6B" in self.model_id and style.emotion != "neutral":
